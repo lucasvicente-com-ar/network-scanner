@@ -273,8 +273,8 @@ function Show-Credits {
     Write-Host ""
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
-    Write-Host "  |          N E T W O R K   S C A N N E R                 |" -ForegroundColor Cyan
-    Write-Host "  |                      v5.2  -  2026                     |" -ForegroundColor Cyan
+    Write-Host "  |          N E T W O R K   S C A N N E R                  |" -ForegroundColor Cyan
+    Write-Host "  |                      v5.2  -  2026                      |" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host ""
