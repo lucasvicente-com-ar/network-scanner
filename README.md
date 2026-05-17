@@ -46,6 +46,6 @@ No requiere instalacion ni dependencias.
 
 ## Requisitos
 
-- Windows 10/11
-- PowerShell 5.1+
-- `curl.exe` (incluido en Windows 10+)
+- Windows 10 / 11
+
+> PowerShell 5.1 y curl.exe vienen incluidos en Windows 10/11, no se necesita instalar nada adicional.
