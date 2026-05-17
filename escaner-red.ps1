@@ -101,7 +101,9 @@ $OUI = @{
 # ── Funciones helper ──────────────────────────────────────────────────────────
 function Get-Vendor($mac) {
     if (-not $mac -or $mac -eq "-") { return "-" }
-    $key = ($mac -replace "[-:]","").ToUpper().Substring(0,6)
+    $clean = ($mac -replace "[-:]","").ToUpper()
+    if ($clean.Length -lt 6) { return "-" }
+    $key = $clean.Substring(0,6)
     if ($OUI[$key]) { return $OUI[$key] }
     return "-"
 }
@@ -116,86 +118,126 @@ function Get-OSFromTTL($ttl) {
 # ── Ping sweep paralelo ───────────────────────────────────────────────────────
 function Invoke-PingSweep([string]$Subred, [int]$Threads=50, [int]$Ms=600) {
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
-    $jobs = 1..254 | ForEach-Object {
-        $ip = "$Subred.$_"
-        $ps = [PowerShell]::Create().AddScript({
-            param($ip,$ms)
-            $r = (New-Object System.Net.NetworkInformation.Ping).Send($ip,$ms)
-            if ($r.Status -eq "Success") { @{IP=$ip;Ms=$r.RoundtripTime;TTL=$r.Options.Ttl} }
-        }).AddArgument($ip).AddArgument($Ms)
-        $ps.RunspacePool = $pool
-        @{PS=$ps; H=$ps.BeginInvoke()}
+    try {
+        $jobs = 1..254 | ForEach-Object {
+            $ip = "$Subred.$_"
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip,$ms)
+                $p = New-Object System.Net.NetworkInformation.Ping
+                try {
+                    $r = $p.Send($ip,$ms)
+                    if ($r.Status -eq "Success") { @{IP=$ip;Ms=$r.RoundtripTime;TTL=$r.Options.Ttl} }
+                } finally {
+                    $p.Dispose()
+                }
+            }).AddArgument($ip).AddArgument($Ms)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }
+        $out = @{}
+        $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r}; $_.PS.Dispose() }
+        return $out
+    } finally {
+        $pool.Close()
+        $pool.Dispose()
     }
-    $out = @{}
-    $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r}; $_.PS.Dispose() }
-    $pool.Close(); return $out
 }
 
 # ── DNS reverso paralelo ──────────────────────────────────────────────────────
 function Invoke-DnsReverse([string[]]$IPs, [int]$Threads=50) {
+    if (-not $IPs) { return @{} }
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
-    $jobs = $IPs | ForEach-Object {
-        $ps = [PowerShell]::Create().AddScript({
-            param($ip)
-            try { $h=[System.Net.Dns]::GetHostEntry($ip).HostName; if($h-ne$ip){@{IP=$ip;Name=($h-split"\.")[0]}} } catch {}
-        }).AddArgument($_)
-        $ps.RunspacePool = $pool
-        @{PS=$ps; H=$ps.BeginInvoke()}
+    try {
+        $jobs = $IPs | ForEach-Object {
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip)
+                try { $h=[System.Net.Dns]::GetHostEntry($ip).HostName; if($h-ne$ip){@{IP=$ip;Name=($h-split"\.")[0]}} } catch {}
+            }).AddArgument($_)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }
+        $out = @{}
+        $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r.Name}; $_.PS.Dispose() }
+        return $out
+    } finally {
+        $pool.Close()
+        $pool.Dispose()
     }
-    $out = @{}
-    $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r.Name}; $_.PS.Dispose() }
-    $pool.Close(); return $out
 }
 
 # ── Port scan paralelo ────────────────────────────────────────────────────────
 function Invoke-PortScan([string[]]$IPs, [int]$Threads=150, [int]$Ms=350) {
+    if (-not $IPs) { return @{} }
     $ports = @(21,22,23,80,443,554,3389,8080,8443)
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
-    $jobs = foreach ($ip in $IPs) { foreach ($p in $ports) {
-        $ps = [PowerShell]::Create().AddScript({
-            param($ip,$p,$ms)
-            $t=New-Object System.Net.Sockets.TcpClient
-            $c=$t.BeginConnect($ip,$p,$null,$null)
-            if($c.AsyncWaitHandle.WaitOne($ms)-and$t.Connected){@{IP=$ip;P=$p}}
-            try{$t.Close()}catch{}
-        }).AddArgument($ip).AddArgument($p).AddArgument($Ms)
-        $ps.RunspacePool = $pool
-        @{PS=$ps; H=$ps.BeginInvoke()}
-    }}
-    $out = @{}
-    $jobs | ForEach-Object {
-        $r=$_.PS.EndInvoke($_.H)
-        if($r){ if(-not$out[$r.IP]){$out[$r.IP]=@()}; $out[$r.IP]+=$r.P }
-        $_.PS.Dispose()
+    try {
+        $jobs = foreach ($ip in $IPs) { foreach ($p in $ports) {
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip,$p,$ms)
+                $t=New-Object System.Net.Sockets.TcpClient
+                $c=$null
+                try {
+                    $c=$t.BeginConnect($ip,$p,$null,$null)
+                    if($c.AsyncWaitHandle.WaitOne($ms)-and$t.Connected){
+                        $t.EndConnect($c)
+                        @{IP=$ip;P=$p}
+                    }
+                } catch {} finally {
+                    if($c){$c.AsyncWaitHandle.Close()}
+                    $t.Close()
+                }
+            }).AddArgument($ip).AddArgument($p).AddArgument($Ms)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }}
+        $out = @{}
+        $jobs | ForEach-Object {
+            $r=$_.PS.EndInvoke($_.H)
+            if($r){
+                if(-not$out.ContainsKey($r.IP)){$out[$r.IP]=New-Object System.Collections.ArrayList}
+                [void]$out[$r.IP].Add($r.P)
+            }
+            $_.PS.Dispose()
+        }
+        return $out
+    } finally {
+        $pool.Close()
+        $pool.Dispose()
     }
-    $pool.Close(); return $out
 }
 
 # ── HTTP title paralelo ───────────────────────────────────────────────────────
 function Invoke-HttpTitles([string[]]$IPs, [hashtable]$PortTable, [int]$Threads=30) {
+    if (-not $IPs) { return @{} }
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
-    $jobs = $IPs | Where-Object { $PortTable[$_] -and ($PortTable[$_] | Where-Object { $_ -in 80,443,8080,8443 }) } | ForEach-Object {
-        $ip=$_; $pp=$PortTable[$ip]
-        $ps = [PowerShell]::Create().AddScript({
-            param($ip,$pp)
-            $urls=@(); if($pp-contains 80){$urls+="http://$ip"}; if($pp-contains 8080){$urls+="http://${ip}:8080"}
-            if($pp-contains 443){$urls+="https://$ip"}; if($pp-contains 8443){$urls+="https://${ip}:8443"}
-            foreach($u in $urls){
-                try{
-                    $h=curl.exe -sk -L --max-time 3 $u 2>$null
-                    if($h-match"<title[^>]*>([^<]{2,60})</title>"){
-                        $t=$matches[1].Trim()-replace"\s+"," "
-                        if($t-and$t-notmatch"404|Not Found|Error"){return @{IP=$ip;T=$t}}
-                    }
-                }catch{}
-            }
-        }).AddArgument($ip).AddArgument($pp)
-        $ps.RunspacePool = $pool
-        @{PS=$ps; H=$ps.BeginInvoke()}
+    try {
+        $jobs = foreach ($ip in $IPs) {
+            $pp=$PortTable[$ip]
+            if (-not $pp -or -not ($pp -contains 80 -or $pp -contains 443 -or $pp -contains 8080 -or $pp -contains 8443)) { continue }
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip,$pp)
+                $urls=@(); if($pp-contains 80){$urls+="http://$ip"}; if($pp-contains 8080){$urls+="http://${ip}:8080"}
+                if($pp-contains 443){$urls+="https://$ip"}; if($pp-contains 8443){$urls+="https://${ip}:8443"}
+                foreach($u in $urls){
+                    try{
+                        $h=curl.exe -sk -L --max-time 3 $u 2>$null
+                        if($h-match"<title[^>]*>([^<]{2,60})</title>"){
+                            $t=$matches[1].Trim()-replace"\s+"," "
+                            if($t-and$t-notmatch"404|Not Found|Error"){return @{IP=$ip;T=$t}}
+                        }
+                    }catch{}
+                }
+            }).AddArgument($ip).AddArgument($pp)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }
+        $out = @{}
+        $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r.T}; $_.PS.Dispose() }
+        return $out
+    } finally {
+        $pool.Close()
+        $pool.Dispose()
     }
-    $out = @{}
-    $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r.T}; $_.PS.Dispose() }
-    $pool.Close(); return $out
 }
 
 # ── Tabla con colores ─────────────────────────────────────────────────────────
@@ -257,15 +299,21 @@ do {
 
     # Detectar interfaces
     $interfaces = @()
+    $adapterNames = @{}
+    Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object { $adapterNames[$_.InterfaceIndex] = $_.Name }
+    $seenInterfaces = @{}
     Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | ForEach-Object {
-        $addr = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress -notmatch "^127\.|^169\.254" } | Select-Object -First 1
-        if ($addr) {
-            $interfaces += [PSCustomObject]@{
-                Num     = $interfaces.Count + 1
-                Nombre  = (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue).Name
-                IP      = $addr.IPAddress
-                Gateway = $_.NextHop
+        if (-not $seenInterfaces[$_.InterfaceIndex]) {
+            $seenInterfaces[$_.InterfaceIndex] = $true
+            $addr = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress -notmatch "^127\.|^169\.254" } | Select-Object -First 1
+            if ($addr) {
+                $interfaces += [PSCustomObject]@{
+                    Num     = $interfaces.Count + 1
+                    Nombre  = $adapterNames[$_.InterfaceIndex]
+                    IP      = $addr.IPAddress
+                    Gateway = $_.NextHop
+                }
             }
         }
     }
@@ -325,9 +373,11 @@ do {
         Where-Object { $_.LinkLayerAddress -notmatch "FF-FF|00-00-00-00-00-00" } |
         ForEach-Object { $macTable[$_.IPAddress] = $_.LinkLayerAddress }
 
-    $allIPs = (@($pingData.Keys) + $miIP + $gateway) |
-              Where-Object { $_ -match "^\d+\.\d+\.\d+\.\d+$" } |
-              Sort-Object { [version]$_ } | Select-Object -Unique
+    $ipSet = @{}
+    @($pingData.Keys) + $miIP + $gateway | ForEach-Object {
+        if ($_ -match "^\d+\.\d+\.\d+\.\d+$") { $ipSet[$_] = $true }
+    }
+    $allIPs = $ipSet.Keys | Sort-Object { [version]$_ }
 
     Write-Host "  [2/4] DNS reverso..." -NoNewline
     $dns = Invoke-DnsReverse $allIPs
