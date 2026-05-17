@@ -282,6 +282,7 @@ function Show-Credits {
     Write-Host ""
     Write-Host "    Lucas M. Vicente" -ForegroundColor White
     Write-Host "    Claude  (Anthropic)" -ForegroundColor Magenta
+    Write-Host "    OpenAI Codex  (optimizacion y mantenimiento)" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  SSDP/UPnP - Ping paralelo - Port scan - DNS reverso" -ForegroundColor DarkGray
     Write-Host "  HTTP title - OUI MAC lookup - TTL OS detection" -ForegroundColor DarkGray
@@ -294,7 +295,7 @@ Show-Credits
 
 do {
     Clear-Host
-    Write-Host "  Escaner de Red  -  Lucas M. Vicente + Claude (Anthropic)" -ForegroundColor DarkGray
+    Write-Host "  Escaner de Red  -  Lucas M. Vicente + Claude (Anthropic) + OpenAI Codex" -ForegroundColor DarkGray
     Write-Host ""
 
     # Detectar interfaces
