@@ -1,4 +1,5 @@
 ﻿#Requires -Version 5.1
+param([switch]$Lite, [switch]$Power)
 $ErrorActionPreference = "SilentlyContinue"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
@@ -111,6 +112,36 @@ $DataDir     = Join-Path $env:LOCALAPPDATA "net-scanner"
 $OuiCache    = Join-Path $DataDir "oui-cache.txt"
 $KnownFile   = Join-Path $DataDir "known-devices.json"
 
+# ── Modos de escaneo ──────────────────────────────────────────────────────────
+# Lite  : lo mas rapido posible (ping + MAC/OUI + WiFi + mini port scan + clasificacion)
+# Power : descubrimiento completo (todas las tecnicas)
+$FullPorts = @(21,22,23,53,80,139,443,445,554,1883,3389,5000,7547,8080,8443,9100)
+$Modes = @{
+    lite = @{
+        Nombre="Lite"; PingThreads=100; PingMs=400
+        Ports=@(80,443,22,8080); PortMs=250
+        DNS=$false; NetBIOS=$false; SNMP=$false; Banners=$false; HttpTitles=$false
+        SSDP=$false; Mdns=$false; WiFi=$true; OuiDownload=$false
+    }
+    power = @{
+        Nombre="Power"; PingThreads=50; PingMs=600
+        Ports=$FullPorts; PortMs=350
+        DNS=$true; NetBIOS=$true; SNMP=$true; Banners=$true; HttpTitles=$true
+        SSDP=$true; Mdns=$true; WiFi=$true; OuiDownload=$true
+    }
+}
+
+function Select-Mode($lite, $power) {
+    if ($lite)  { return "lite" }
+    if ($power) { return "power" }
+    Write-Host ""
+    Write-Host "  Modo de escaneo:" -ForegroundColor White
+    Write-Host "    [1] Lite   " -ForegroundColor Cyan -NoNewline; Write-Host "rapido: ping + MAC/fabricante + WiFi + clasificacion" -ForegroundColor Gray
+    Write-Host "    [2] Power  " -ForegroundColor Magenta -NoNewline; Write-Host "completo: + puertos, SNMP, mDNS, NetBIOS, banners, HTTP, UPnP" -ForegroundColor Gray
+    $s = Read-Host "  Elegir modo [1/2] (Enter = 1)"
+    if ($s -eq "2") { return "power" } else { return "lite" }
+}
+
 # ── Normalizacion de nombre de fabricante ─────────────────────────────────────
 function Convert-VendorName($name) {
     if (-not $name) { return "-" }
@@ -201,7 +232,7 @@ function Get-DeviceType($vendor, $name, $ports, $isGateway, $isSelf, $gatewayVen
 }
 
 # ── Base OUI IEEE: carga desde cache o descarga (fallback silencioso) ──────────
-function Get-OuiDatabase {
+function Get-OuiDatabase($allowDownload = $true) {
     $db = @{}
     try {
         if (Test-Path $OuiCache) {
@@ -212,6 +243,8 @@ function Get-OuiDatabase {
             if ($db.Count -gt 1000 -and $age -lt 45) { return $db }
         }
     } catch {}
+    # En modo lite no descargamos: usar cache (aunque sea vieja) o tabla interna
+    if (-not $allowDownload) { return $db }
     # Descargar catalogo IEEE
     try {
         if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
@@ -505,9 +538,10 @@ function Get-WifiAPs {
 }
 
 # ── Port scan paralelo ────────────────────────────────────────────────────────
-function Invoke-PortScan([string[]]$IPs, [int]$Threads=150, [int]$Ms=350) {
+function Invoke-PortScan([string[]]$IPs, [int[]]$Ports, [int]$Threads=150, [int]$Ms=350) {
     if (-not $IPs) { return @{} }
-    $ports = @(21,22,23,53,80,139,443,445,554,1883,3389,5000,7547,8080,8443,9100)
+    if (-not $Ports) { $Ports = @(21,22,23,53,80,139,443,445,554,1883,3389,5000,7547,8080,8443,9100) }
+    $ports = $Ports
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
     try {
         $jobs = foreach ($ip in $IPs) { foreach ($p in $ports) {
@@ -860,7 +894,7 @@ function Show-Credits {
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
     Write-Host "  |          N E T W O R K   S C A N N E R                  |" -ForegroundColor Cyan
-    Write-Host "  |                      v6.0  -  2026                      |" -ForegroundColor Cyan
+    Write-Host "  |                      v6.1  -  2026                      |" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host ""
@@ -872,6 +906,7 @@ function Show-Credits {
     Write-Host ""
     Write-Host "  WiFi BSSID - mDNS - NetBIOS - SNMP - Banners - OUI IEEE" -ForegroundColor DarkGray
     Write-Host "  SSDP/UPnP - Ping/Port scan - Clasificacion - Reporte HTML" -ForegroundColor DarkGray
+    Write-Host "  Modos: Lite (rapido) / Power (completo)" -ForegroundColor DarkGray
     Write-Host ""
     Start-Sleep -Seconds 2
 }
@@ -880,15 +915,20 @@ function Show-Credits {
 Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
 Show-Credits
 
-# Cargar base OUI IEEE (cache/descarga) una vez por ejecucion
+# Elegir modo (parametro -Lite/-Power, o menu interactivo)
+$modo = Select-Mode $Lite $Power
+$cfg  = $Modes[$modo]
+
+# Cargar base OUI IEEE (en lite solo desde cache; en power descarga si falta)
 Write-Host "  Cargando base de fabricantes OUI..." -NoNewline -ForegroundColor DarkGray
-$OUIFull = Get-OuiDatabase
+$OUIFull = Get-OuiDatabase $cfg.OuiDownload
 if ($OUIFull.Count -gt 1000) { Write-Host " $($OUIFull.Count) fabricantes." -ForegroundColor Green }
 else { Write-Host " tabla base (sin catalogo IEEE)." -ForegroundColor DarkGray }
 
 do {
     Clear-Host
     Write-Host "  Escaner de Red  -  Lucas M. Vicente + Claude (Anthropic) + OpenAI Codex" -ForegroundColor DarkGray
+    Write-Host "  Modo: $($cfg.Nombre)" -ForegroundColor $(if ($modo -eq 'power') { 'Magenta' } else { 'Cyan' })
     Write-Host ""
 
     # Detectar interfaces
@@ -926,15 +966,21 @@ do {
     $subred  = ($miIP -split "\." | Select-Object -First 3) -join "."
     Write-Host "  $($sel.Nombre)  |  $miIP  |  gw $gateway`n" -ForegroundColor DarkGray
 
-    # Jobs de escucha (corren mientras hacemos ping/puertos)
-    $ssdpJob  = Start-SsdpJob
-    $mdnsJob  = Start-MdnsJob
+    # Jobs de escucha pasiva (solo Power; corren mientras hacemos ping/puertos)
+    $ssdpJob = if ($cfg.SSDP) { Start-SsdpJob } else { $null }
+    $mdnsJob = if ($cfg.Mdns) { Start-MdnsJob } else { $null }
 
-    $step = 0; $steps = 8
-    function Progreso($msg){ $script:step++; Write-Progress -Activity "Escaneando $subred.0/24" -Status "$msg" -PercentComplete ([int](($script:step/$steps)*100)) }
+    # Numero de fases segun el modo (para la barra de progreso)
+    $steps = 4
+    if ($cfg.DNS -or $cfg.NetBIOS)     { $steps++ }
+    if ($cfg.SNMP)                     { $steps++ }
+    if ($cfg.Banners -or $cfg.HttpTitles) { $steps++ }
+    if ($cfg.SSDP -or $cfg.Mdns)       { $steps++ }
+    $step = 0
+    function Progreso($msg){ $script:step++; Write-Progress -Activity "Escaneando $subred.0/24 [$($cfg.Nombre)]" -Status "$msg" -PercentComplete ([int](($script:step/$steps)*100)) }
 
-    Progreso "Ping sweep + descubrimiento SSDP/mDNS"
-    $pingData = Invoke-PingSweep $subred
+    Progreso "Ping sweep"
+    $pingData = Invoke-PingSweep $subred $cfg.PingThreads $cfg.PingMs
 
     Progreso "Leyendo tabla ARP"
     $macTable = @{}
@@ -949,25 +995,33 @@ do {
     $allIPs = $ipSet.Keys | Sort-Object { [version]$_ }
 
     Progreso "Escaneo de puertos"
-    $ports = Invoke-PortScan $allIPs
+    $ports = Invoke-PortScan $allIPs $cfg.Ports -Ms $cfg.PortMs
 
-    Progreso "DNS reverso + NetBIOS"
-    $dns      = Invoke-DnsReverse $allIPs
-    $netbios  = Invoke-Netbios $allIPs
+    if ($cfg.DNS -or $cfg.NetBIOS) {
+        Progreso "DNS reverso + NetBIOS"
+        $dns     = if ($cfg.DNS)     { Invoke-DnsReverse $allIPs } else { @{} }
+        $netbios = if ($cfg.NetBIOS) { Invoke-Netbios $allIPs }   else { @{} }
+    } else { $dns = @{}; $netbios = @{} }
 
-    Progreso "SNMP (modelos de equipo)"
-    $snmp = Invoke-Snmp $allIPs (New-SnmpRequest)
+    if ($cfg.SNMP) {
+        Progreso "SNMP (modelos de equipo)"
+        $snmp = Invoke-Snmp $allIPs (New-SnmpRequest)
+    } else { $snmp = @{} }
 
-    Progreso "Banners de servicio + titulos HTTP"
-    $banners = Invoke-Banners $allIPs $ports
-    $titles  = Invoke-HttpTitles $allIPs $ports
+    if ($cfg.Banners -or $cfg.HttpTitles) {
+        Progreso "Banners de servicio + titulos HTTP"
+        $banners = if ($cfg.Banners)    { Invoke-Banners $allIPs $ports }    else { @{} }
+        $titles  = if ($cfg.HttpTitles) { Invoke-HttpTitles $allIPs $ports } else { @{} }
+    } else { $banners = @{}; $titles = @{} }
 
     Progreso "Radios WiFi (BSSID)"
-    $wifi = Get-WifiAPs
+    $wifi = if ($cfg.WiFi) { Get-WifiAPs } else { [PSCustomObject]@{ SSID=$null; MyBssid=$null; APs=@(); Error=$null } }
 
-    Progreso "Recolectando descubrimiento pasivo"
-    $upnp = Receive-Job $ssdpJob -Wait -AutoRemoveJob; if (-not $upnp) { $upnp = @{} }
-    $mdns = Receive-Job $mdnsJob -Wait -AutoRemoveJob; if (-not $mdns) { $mdns = @{} }
+    if ($cfg.SSDP -or $cfg.Mdns) {
+        Progreso "Recolectando descubrimiento pasivo"
+        $upnp = if ($ssdpJob) { Receive-Job $ssdpJob -Wait -AutoRemoveJob } else { @{} }; if (-not $upnp) { $upnp = @{} }
+        $mdns = if ($mdnsJob) { Receive-Job $mdnsJob -Wait -AutoRemoveJob } else { @{} }; if (-not $mdns) { $mdns = @{} }
+    } else { $upnp = @{}; $mdns = @{} }
     Write-Progress -Activity "Escaneando" -Completed
 
     # Fabricante del gateway (por OUI) para detectar repetidores de la misma malla
@@ -1096,8 +1150,19 @@ do {
     try { Start-Process $html } catch {}
     Write-Host ""
 
-    # Menu: reescanear / alias / salir
-    $op = Read-Host "  [s] escanear de nuevo   [a] poner alias a una IP   [n] salir"
+    # Menu: reescanear / cambiar modo / alias / salir
+    $op = Read-Host "  [s] escanear de nuevo   [m] cambiar modo   [a] poner alias a una IP   [n] salir"
+    if ($op -eq "m") {
+        $modo = Select-Mode $false $false
+        $cfg  = $Modes[$modo]
+        # Si pasamos a Power y aun no tenemos catalogo OUI, intentar descargarlo
+        if ($cfg.OuiDownload -and $OUIFull.Count -le 1000) {
+            Write-Host "  Actualizando base OUI..." -NoNewline -ForegroundColor DarkGray
+            $OUIFull = Get-OuiDatabase $true
+            Write-Host " $($OUIFull.Count)." -ForegroundColor Green
+        }
+        $op = "s"
+    }
     if ($op -eq "a") {
         $aip = Read-Host "    IP a etiquetar"
         $row = $rows | Where-Object { $_.IP -eq $aip } | Select-Object -First 1

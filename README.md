@@ -2,7 +2,16 @@
 
 Escaner de red local para Windows. Detecta dispositivos activos, los clasifica por tipo, identifica repetidores/puntos de acceso y genera un reporte HTML.
 
-Version actual: **v6.0**
+Version actual: **v6.1**
+
+## Modos de escaneo
+
+Al arrancar puedes elegir el modo (o pasar `-Lite` / `-Power` como parametro):
+
+- **Lite**: lo mas rapido posible. Ping + MAC/fabricante + WiFi BSSID + mini escaneo de puertos + clasificacion. Sin descubrimiento pasivo ni descarga del catalogo OUI. Ideal para un inventario rapido (~2x mas rapido que Power).
+- **Power**: descubrimiento completo. Anade port scan completo, SNMP, mDNS, NetBIOS, banners, titulos HTTP, SSDP/UPnP y catalogo OUI IEEE. Ideal para identificar equipos con el maximo detalle.
+
+Puedes cambiar de modo entre escaneos con la opcion `[m]` del menu.
 
 ## Caracteristicas
 
@@ -21,6 +30,12 @@ Version actual: **v6.0**
 - **Historial con alias**: recuerda dispositivos por MAC, permite ponerles alias y marca los **dispositivos nuevos** desde el ultimo escaneo.
 - **Exporta CSV** con fecha y hora, incluyendo Tipo e Info tecnica.
 - **Multi-red**: permite elegir interfaz si hay varias redes disponibles.
+
+## Actualizaciones v6.1
+
+- **Modos Lite y Power**: elige entre inventario rapido o descubrimiento completo, con menu al inicio, parametros `-Lite`/`-Power` y cambio de modo en caliente (`[m]`).
+- En modo Lite el catalogo OUI no se descarga (usa cache o tabla interna) y el escaneo de puertos es minimo, para maxima velocidad.
+- Barra de progreso adaptada al numero de fases de cada modo.
 
 ## Actualizaciones v6.0
 
@@ -52,7 +67,12 @@ Version actual: **v6.0**
 
 ## Uso
 
-Doble clic en `escaner-red.exe`.
+Doble clic en `escaner-red.exe` y elige el modo (Lite o Power). Tambien puedes ejecutarlo con un modo fijo:
+
+```
+escaner-red.exe -Lite
+escaner-red.exe -Power
+```
 
 No requiere instalacion ni dependencias externas. Al terminar cada escaneo:
 
