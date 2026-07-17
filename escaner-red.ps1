@@ -1,7 +1,8 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 $ErrorActionPreference = "SilentlyContinue"
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
-# ── OUI: MAC → Fabricante ─────────────────────────────────────────────────────
+# ── OUI: MAC → Fabricante (tabla base, nombres normalizados) ───────────────────
 $OUI = @{
     "0027E3"="TP-Link";"1C3BD3"="TP-Link";"50BD5F"="TP-Link";"6C5AB0"="TP-Link";"8C25BA"="TP-Link"
     "A0F3C1"="TP-Link";"B095B9"="TP-Link";"C04A00"="TP-Link";"D80DC7"="TP-Link";"E492FB"="TP-Link"
@@ -98,13 +99,59 @@ $OUI = @{
     "F4F5E8"="Chromecast"
 }
 
+# Base OUI ampliada (IEEE), se puebla en runtime desde cache/descarga
+$OUIFull = @{}
+
+# Fabricantes de equipamiento de red (routers, repetidores, APs, mesh)
+$NetVendors = @("TP-Link","ASUS","Netgear","D-Link","Linksys","Tenda","Mercusys","Eero","Ubiquiti",
+                "Sagemcom","Technicolor","Arris","ZTE","Cisco","Zyxel","AVM","Cambium","Aruba","MikroTik")
+
+# Rutas de datos persistentes
+$DataDir     = Join-Path $env:LOCALAPPDATA "net-scanner"
+$OuiCache    = Join-Path $DataDir "oui-cache.txt"
+$KnownFile   = Join-Path $DataDir "known-devices.json"
+
+# ── Normalizacion de nombre de fabricante ─────────────────────────────────────
+function Convert-VendorName($name) {
+    if (-not $name) { return "-" }
+    $n = $name.Trim()
+    $map = @(
+        @('tp.?link','TP-Link'), @('\basus','ASUS'), @('netgear','Netgear'), @('d.?link','D-Link'),
+        @('linksys','Linksys'), @('tenda','Tenda'), @('mercusys','Mercusys'), @('\beero','Eero'),
+        @('ubiquiti','Ubiquiti'), @('sagemcom','Sagemcom'), @('technicolor','Technicolor'),
+        @('arris','Arris'), @('\bzte\b','ZTE'), @('cisco','Cisco'), @('zyxel','Zyxel'),
+        @('avm ','AVM'), @('mikrotik|routerboard','MikroTik'), @('aruba','Aruba'),
+        @('apple','Apple'), @('samsung','Samsung'), @('xiaomi','Xiaomi'), @('huawei','Huawei'),
+        @('amazon','Amazon'), @('google','Google'), @('\bsony','Sony'),
+        @('lg electronics|lg innotek','LG'), @('hikvision','Hikvision'), @('ezviz','Ezviz'),
+        @('intel','Intel'), @('realtek','Realtek'), @('raspberry','Raspberry Pi'),
+        @('nintendo','Nintendo'), @('microsoft','Microsoft'), @('dell','Dell'),
+        @('hewlett|hp inc','HP'), @('lenovo','Lenovo'), @('philips','Philips'),
+        @('sonos','Sonos'), @('roku','Roku'), @('espressif','Espressif'),
+        @('tuya','Tuya'), @('shenzhen','Shenzhen'), @('azurewave','AzureWave')
+    )
+    foreach ($m in $map) { if ($n -imatch $m[0]) { return $m[1] } }
+    # Nombre largo del IEEE: recortar a algo legible
+    $n = $n -replace '(?i)\b(technologies?|technology|co\.?|ltd\.?|inc\.?|corp\.?|corporation|gmbh|limited|company|electronics?)\b',''
+    $n = ($n -replace '[",]',' ' -replace '\s+',' ').Trim()
+    if ($n.Length -gt 18) { $n = $n.Substring(0,18) }
+    if (-not $n) { return "-" }
+    return $n
+}
+
 # ── Funciones helper ──────────────────────────────────────────────────────────
-function Get-Vendor($mac) {
-    if (-not $mac -or $mac -eq "-") { return "-" }
+function Get-VendorKey($mac) {
+    if (-not $mac -or $mac -eq "-") { return $null }
     $clean = ($mac -replace "[-:]","").ToUpper()
-    if ($clean.Length -lt 6) { return "-" }
-    $key = $clean.Substring(0,6)
-    if ($OUI[$key]) { return $OUI[$key] }
+    if ($clean.Length -lt 6) { return $null }
+    return $clean.Substring(0,6)
+}
+
+function Get-Vendor($mac) {
+    $key = Get-VendorKey $mac
+    if (-not $key) { return "-" }
+    if ($OUI[$key])     { return $OUI[$key] }
+    if ($OUIFull[$key]) { return (Convert-VendorName $OUIFull[$key]) }
     return "-"
 }
 
@@ -115,32 +162,32 @@ function Get-OSFromTTL($ttl) {
     return "Router/IoT"
 }
 
-# Fabricantes de equipamiento de red (routers, repetidores, APs, mesh)
-$NetVendors = @("TP-Link","ASUS","Netgear","D-Link","Linksys","Tenda","Mercusys","Eero","Ubiquiti")
-
 # ── Clasificacion de tipo de dispositivo ──────────────────────────────────────
-function Get-DeviceType($vendor, $name, $ports, $isGateway, $isSelf, $gatewayVendor) {
+function Get-DeviceType($vendor, $name, $ports, $isGateway, $isSelf, $gatewayVendor, $info) {
     if ($isSelf)    { return "Este PC" }
     if ($isGateway) { return "Router" }
     $n = if ($name -and $name -ne "-") { $name } else { "" }
+    $i = if ($info -and $info -ne "-") { $info } else { "" }
     $hasWebAdmin = @($ports | Where-Object { $_ -in 80,443,8080,8443 }).Count -gt 0
 
-    # Nombre explicito de repetidor / mesh (UPnP, HTTP title o DNS)
-    if ($n -match "(?i)repeat|extend|range.?ext|\bRE\d|\bEX\d|mesh|deco|velop|orbi|\beero\b|access.?point|\bAP[- ]?\d") {
+    # Nombre / banner / SNMP con indicios de repetidor o mesh
+    if (($n + " " + $i) -match "(?i)repeat|extend|range.?ext|\bRE\d|\bEX\d|mesh|deco|velop|orbi|\beero\b|access.?point|\bAP[- ]?\d") {
         return "Repetidor/AP"
     }
+    # Banner / SNMP con indicios de router
+    if ($i -match "(?i)router|gateway|openwrt|dd-wrt|rt-ac|rt-ax|archer") { return "Router sec." }
     # Camara IP
-    if ($vendor -match "Hikvision|Ezviz" -or ($ports -contains 554)) { return "Camara" }
+    if ($vendor -match "Hikvision|Ezviz" -or ($ports -contains 554) -or $i -match "(?i)camera|ipcam|dvr|nvr") { return "Camara" }
     # Streaming / media
-    if ($vendor -match "Roku|Chromecast|Sonos") { return "TV/Media" }
+    if ($vendor -match "Roku|Chromecast|Sonos" -or $i -match "(?i)chromecast|roku|smart.?tv|bravia|webos") { return "TV/Media" }
     # Consola
     if ($vendor -eq "Nintendo") { return "Consola" }
+    # Impresora
+    if ($ports -contains 9100 -or $i -match "(?i)printer|jetdirect|laserjet|officejet") { return "Impresora" }
     # Mismo fabricante que el router + no es el gateway  => casi seguro repetidor/AP de la malla
     if ($vendor -ne "-" -and $vendor -eq $gatewayVendor) { return "Repetidor/AP?" }
     # Fabricante de red con panel de admin web => probable repetidor/AP
     if (($NetVendors -contains $vendor) -and $hasWebAdmin)  { return "Repetidor/AP?" }
-    # Impresora
-    if ($ports -contains 9100) { return "Impresora" }
     # Movil / tablet (fabricante de moviles y sin panel web)
     if ($vendor -match "Apple|Samsung|Xiaomi|Huawei|LG|Sony" -and -not $hasWebAdmin) { return "Movil/Tablet" }
     # Asistentes / altavoces
@@ -149,7 +196,42 @@ function Get-DeviceType($vendor, $name, $ports, $isGateway, $isSelf, $gatewayVen
     if ($ports -contains 3389 -or $ports -contains 22) { return "PC" }
     if ($vendor -match "Intel|Dell|^HP$|Lenovo|Microsoft|Realtek") { return "PC" }
     if ($vendor -eq "Raspberry Pi") { return "Raspberry Pi" }
+    if ($vendor -match "Espressif|Tuya") { return "IoT" }
     return "-"
+}
+
+# ── Base OUI IEEE: carga desde cache o descarga (fallback silencioso) ──────────
+function Get-OuiDatabase {
+    $db = @{}
+    try {
+        if (Test-Path $OuiCache) {
+            foreach ($ln in [System.IO.File]::ReadLines($OuiCache)) {
+                $i = $ln.IndexOf('='); if ($i -eq 6) { $db[$ln.Substring(0,6)] = $ln.Substring(7) }
+            }
+            $age = ((Get-Date) - (Get-Item $OuiCache).LastWriteTime).TotalDays
+            if ($db.Count -gt 1000 -and $age -lt 45) { return $db }
+        }
+    } catch {}
+    # Descargar catalogo IEEE
+    try {
+        if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+        $csv = curl.exe -sk --max-time 25 "https://standards-oui.ieee.org/oui/oui.csv" 2>$null
+        if ($csv -and $csv.Count -gt 1000) {
+            $new = @{}
+            foreach ($line in $csv) {
+                if ($line -match '^MA-L,([0-9A-Fa-f]{6}),"?([^",]+)') {
+                    $new[$matches[1].ToUpper()] = $matches[2].Trim()
+                }
+            }
+            if ($new.Count -gt 1000) {
+                $sb = New-Object System.Text.StringBuilder
+                foreach ($k in $new.Keys) { [void]$sb.AppendLine("$k=$($new[$k])") }
+                [System.IO.File]::WriteAllText($OuiCache, $sb.ToString())
+                return $new
+            }
+        }
+    } catch {}
+    return $db
 }
 
 # ── Ping sweep paralelo ───────────────────────────────────────────────────────
@@ -202,10 +284,230 @@ function Invoke-DnsReverse([string[]]$IPs, [int]$Threads=50) {
     }
 }
 
+# ── NetBIOS (NBSTAT, UDP 137) paralelo ────────────────────────────────────────
+function Invoke-Netbios([string[]]$IPs, [int]$Threads=60, [int]$Ms=700) {
+    if (-not $IPs) { return @{} }
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
+    try {
+        $jobs = $IPs | ForEach-Object {
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip,$ms)
+                try {
+                    # NBSTAT node status request para el nombre comodin "*"
+                    $req = New-Object byte[] 50
+                    $req[0]=0x00; $req[1]=0x00      # transaction id
+                    $req[2]=0x00; $req[3]=0x00      # flags
+                    $req[4]=0x00; $req[5]=0x01      # QDCOUNT=1
+                    # nombre codificado: 0x20 + "CKAAAA...AA" (32) + 0x00
+                    $req[6]=0x20
+                    $enc="CK"+("AA"*15)
+                    for($i=0;$i-lt32;$i++){ $req[7+$i]=[byte][char]$enc[$i] }
+                    $req[39]=0x00                    # fin del nombre
+                    $req[40]=0x00; $req[41]=0x21      # QTYPE=NBSTAT(0x21)
+                    $req[42]=0x00; $req[43]=0x01      # QCLASS=IN
+                    $udp=New-Object System.Net.Sockets.UdpClient
+                    $udp.Client.ReceiveTimeout=$ms
+                    [void]$udp.Send($req,44,$ip,137)
+                    $ep=New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,0)
+                    $resp=$udp.Receive([ref]$ep); $udp.Close()
+                    if($resp.Length -lt 57){ return }
+                    $num=$resp[56]; $pos=57; $best=$null
+                    for($k=0;$k -lt $num -and ($pos+17) -lt $resp.Length;$k++){
+                        $nm=[System.Text.Encoding]::ASCII.GetString($resp,$pos,15).Trim()
+                        $suffix=$resp[$pos+15]; $flags=$resp[$pos+16]
+                        $isGroup=($flags -band 0x80) -ne 0
+                        if(-not $isGroup -and $suffix -eq 0x00 -and $nm -and $nm -notmatch '^\x01\x02'){ $best=$nm; break }
+                        $pos+=18
+                    }
+                    if($best){ @{IP=$ip;Name=$best} }
+                } catch {}
+            }).AddArgument($_).AddArgument($Ms)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }
+        $out = @{}
+        $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r.Name}; $_.PS.Dispose() }
+        return $out
+    } finally {
+        $pool.Close(); $pool.Dispose()
+    }
+}
+
+# ── mDNS (Bonjour, UDP 5353) en un job de escucha ─────────────────────────────
+function Start-MdnsJob {
+    Start-Job -ScriptBlock {
+        # Parser DNS minimo con soporte de compresion de nombres
+        function Read-Name($b,[int]$p){
+            $labels=@(); $jumped=$false; $safety=0
+            while($safety -lt 128){
+                $safety++
+                if($p -ge $b.Length){ break }
+                $len=$b[$p]
+                if($len -eq 0){ if(-not $jumped){$p++}; break }
+                if(($len -band 0xC0) -eq 0xC0){
+                    $ptr=(($len -band 0x3F) -shl 8) -bor $b[$p+1]
+                    if(-not $jumped){ $p+=2 }
+                    $p=$ptr; $jumped=$true; continue
+                }
+                $p++
+                if($p+$len -gt $b.Length){ break }
+                $labels+=[System.Text.Encoding]::UTF8.GetString($b,$p,$len)
+                $p+=$len
+            }
+            return ($labels -join ".")
+        }
+        $out=@{}
+        try{
+            $udp=New-Object System.Net.Sockets.UdpClient
+            $udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket,[System.Net.Sockets.SocketOptionName]::ReuseAddress,$true)
+            # Bind a 5353 + unirse al grupo multicast para recibir las respuestas
+            # (mDNS responde por multicast, no al puerto efimero). Fallback silencioso.
+            try {
+                $udp.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,5353)))
+                $udp.JoinMulticastGroup([System.Net.IPAddress]::Parse("224.0.0.251"))
+            } catch {}
+            $udp.Client.ReceiveTimeout=4500
+            $ep=New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("224.0.0.251"),5353)
+            # Consultar servicios comunes: sus respuestas incluyen el A record (hostname.local -> IP)
+            $svcs=@("_services._dns-sd._udp.local","_http._tcp.local","_workstation._tcp.local",
+                    "_googlecast._tcp.local","_airplay._tcp.local","_raop._tcp.local",
+                    "_ipp._tcp.local","_printer._tcp.local","_companion-link._tcp.local",
+                    "_spotify-connect._tcp.local","_amzn-wplay._tcp.local","_homekit._tcp.local",
+                    "_device-info._tcp.local","_smb._tcp.local")
+            foreach($svc in $svcs){
+                $q=New-Object System.Collections.Generic.List[byte]
+                0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00 | ForEach-Object { $q.Add([byte]$_) }
+                foreach($lbl in ($svc -split "\.")){
+                    $q.Add([byte]$lbl.Length); [System.Text.Encoding]::ASCII.GetBytes($lbl) | ForEach-Object { $q.Add($_) }
+                }
+                $q.Add(0x00); $q.Add(0x00); $q.Add(0x0C); $q.Add(0x80); $q.Add(0x01)
+                try { [void]$udp.Send($q.ToArray(),$q.Count,$ep) } catch {}
+            }
+            $deadline=(Get-Date).AddSeconds(4.5)
+            while((Get-Date) -lt $deadline){
+                try{
+                    $rep=New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,0)
+                    $data=$udp.Receive([ref]$rep)
+                    $src=$rep.Address.ToString()
+                    if($data.Length -lt 12){ continue }
+                    $qd=($data[4] -shl 8) -bor $data[5]
+                    $an=($data[6] -shl 8) -bor $data[7]
+                    $ns=($data[8] -shl 8) -bor $data[9]
+                    $ar=($data[10] -shl 8) -bor $data[11]
+                    $pos=12
+                    # saltar preguntas
+                    for($i=0;$i -lt $qd;$i++){
+                        while($pos -lt $data.Length -and $data[$pos] -ne 0){
+                            if(($data[$pos] -band 0xC0) -eq 0xC0){ $pos++; break }
+                            $pos+=$data[$pos]+1
+                        }
+                        $pos+=1; $pos+=4
+                    }
+                    $total=$an+$ns+$ar
+                    for($i=0;$i -lt $total -and $pos -lt $data.Length;$i++){
+                        $name=Read-Name $data $pos
+                        # avanzar el NAME
+                        while($pos -lt $data.Length){
+                            $l=$data[$pos]
+                            if($l -eq 0){ $pos++; break }
+                            if(($l -band 0xC0) -eq 0xC0){ $pos+=2; break }
+                            $pos+=$l+1
+                        }
+                        if($pos+10 -gt $data.Length){ break }
+                        $type=($data[$pos] -shl 8) -bor $data[$pos+1]
+                        $rdlen=($data[$pos+8] -shl 8) -bor $data[$pos+9]
+                        $rdpos=$pos+10
+                        if($type -eq 1 -and $rdlen -eq 4){
+                            $aip="$($data[$rdpos]).$($data[$rdpos+1]).$($data[$rdpos+2]).$($data[$rdpos+3])"
+                            $hn=($name -replace '\.local$','')
+                            if($hn -and -not $out.ContainsKey($aip)){ $out[$aip]=$hn }
+                        }
+                        $pos=$rdpos+$rdlen
+                    }
+                } catch { break }
+            }
+            $udp.Close()
+        } catch {}
+        return $out
+    }
+}
+
+# ── SSDP/UPnP en un job de escucha ────────────────────────────────────────────
+function Start-SsdpJob {
+    Start-Job -ScriptBlock {
+        $msg   = "M-SEARCH * HTTP/1.1`r`nHOST: 239.255.255.250:1900`r`nMAN: `"ssdp:discover`"`r`nMX: 2`r`nST: ssdp:all`r`n`r`n"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($msg)
+        $udp   = New-Object System.Net.Sockets.UdpClient
+        $udp.Client.ReceiveTimeout = 2500
+        $ep    = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("239.255.255.250"), 1900)
+        [void]$udp.Send($bytes, $bytes.Length, $ep)
+        $seen = @{}; $out = @{}
+        while ($true) {
+            try {
+                $data = $udp.Receive([ref]$ep); $ip = $ep.Address.ToString()
+                if ($seen[$ip]) { continue }; $seen[$ip] = $true
+                $txt = [System.Text.Encoding]::ASCII.GetString($data)
+                $loc = if ($txt -match "(?i)LOCATION:\s*(\S+)") { $matches[1] } else { $null }
+                $out[$ip] = [PSCustomObject]@{ FriendlyName=$null; Manufacturer=$null; Model=$null; LocationURL=$loc }
+            } catch { break }
+        }
+        $udp.Close()
+        foreach ($ip in @($out.Keys)) {
+            if (-not $out[$ip].LocationURL) { continue }
+            try {
+                $xml = [xml](curl.exe -sk -L --max-time 2 $out[$ip].LocationURL 2>$null)
+                $out[$ip].FriendlyName = $xml.root.device.friendlyName
+                $out[$ip].Manufacturer = $xml.root.device.manufacturer
+                $out[$ip].Model        = $xml.root.device.modelName
+            } catch {}
+        }
+        return $out
+    }
+}
+
+# ── WiFi: APs de mi red por radio (netsh BSSID) ───────────────────────────────
+function Get-WifiAPs {
+    $result = [PSCustomObject]@{ SSID=$null; MyBssid=$null; APs=@(); Error=$null }
+    $iface = netsh wlan show interfaces 2>&1
+    $ifaceTxt = ($iface | Out-String)
+    if ($ifaceTxt -match "(?i)location|ubicaci") {
+        $result.Error = "location"; return $result
+    }
+    if ($ifaceTxt -match "(?i)no hay|is no wireless|not running|no está en") {
+        $result.Error = "nowifi"; return $result
+    }
+    # SSID actual (evitando BSSID). Toma el valor tras 'SSID :'
+    foreach ($ln in $iface) {
+        if ($ln -match '^\s*SSID\s*:\s*(.+?)\s*$')  { $result.SSID    = $matches[1].Trim() }
+        if ($ln -match '^\s*BSSID\s*:\s*([0-9A-Fa-f:]{17})') { $result.MyBssid = $matches[1].ToUpper() }
+    }
+    if (-not $result.SSID) { $result.Error = "nowifi"; return $result }
+
+    $net = netsh wlan show networks mode=bssid 2>&1
+    $curSsid=$null; $aps=@(); $cur=$null
+    foreach ($ln in $net) {
+        if ($ln -match '^\s*SSID\s+\d+\s*:\s*(.*)$') { $curSsid = $matches[1].Trim(); continue }
+        if ($ln -match '^\s*BSSID\s+\d+\s*:\s*([0-9A-Fa-f:]{17})') {
+            if ($cur) { $aps += $cur }
+            $cur = [PSCustomObject]@{ SSID=$curSsid; BSSID=$matches[1].ToUpper(); Signal=$null; Channel=$null; Radio=$null }
+            continue
+        }
+        if ($cur) {
+            if ($ln -match '(\d{1,3})\s*%')                          { $cur.Signal  = [int]$matches[1] }
+            if ($ln -match '(?i)(?:channel|canal)\s*:\s*(\d+)')      { $cur.Channel = $matches[1] }
+            if ($ln -match '(?i)(?:radio type|tipo de radio)\s*:\s*(.+?)\s*$') { $cur.Radio = $matches[1].Trim() }
+        }
+    }
+    if ($cur) { $aps += $cur }
+    # Solo los BSSID de MI red (mismo SSID)
+    $result.APs = @($aps | Where-Object { $_.SSID -eq $result.SSID })
+    return $result
+}
+
 # ── Port scan paralelo ────────────────────────────────────────────────────────
 function Invoke-PortScan([string[]]$IPs, [int]$Threads=150, [int]$Ms=350) {
     if (-not $IPs) { return @{} }
-    $ports = @(21,22,23,80,443,554,3389,8080,8443,9100)
+    $ports = @(21,22,23,53,80,139,443,445,554,1883,3389,5000,7547,8080,8443,9100)
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
     try {
         $jobs = foreach ($ip in $IPs) { foreach ($p in $ports) {
@@ -243,6 +545,127 @@ function Invoke-PortScan([string[]]$IPs, [int]$Threads=150, [int]$Ms=350) {
     }
 }
 
+# ── Banners de servicio (SSH/FTP/Telnet) + header HTTP Server ──────────────────
+function Invoke-Banners([string[]]$IPs, [hashtable]$PortTable, [int]$Threads=40) {
+    if (-not $IPs) { return @{} }
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
+    try {
+        $jobs = foreach ($ip in $IPs) {
+            $pp = $PortTable[$ip]
+            if (-not $pp) { continue }
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip,$pp)
+                $found=$null
+                # Banners que el servidor envia al conectar (SSH 22, FTP 21, Telnet 23)
+                foreach($bp in @(22,21,23)){
+                    if($pp -notcontains $bp){ continue }
+                    try{
+                        $t=New-Object System.Net.Sockets.TcpClient
+                        $c=$t.BeginConnect($ip,$bp,$null,$null)
+                        if($c.AsyncWaitHandle.WaitOne(700) -and $t.Connected){
+                            $t.EndConnect($c); $t.ReceiveTimeout=700
+                            $s=$t.GetStream(); Start-Sleep -Milliseconds 150
+                            $buf=New-Object byte[] 160
+                            if($s.DataAvailable){ $n=$s.Read($buf,0,160) } else { $n=0 }
+                            if($n -gt 0){
+                                $b=([System.Text.Encoding]::ASCII.GetString($buf,0,$n) -replace '[\r\n\x00-\x1F]',' ').Trim()
+                                if($b){ $found=($b -replace '\s+',' '); }
+                            }
+                            $t.Close()
+                        } else { $t.Close() }
+                    } catch {}
+                    if($found){ break }
+                }
+                # Header HTTP Server
+                if(-not $found -and ($pp -contains 80 -or $pp -contains 8080 -or $pp -contains 443 -or $pp -contains 8443)){
+                    $u = if($pp -contains 80){"http://$ip"} elseif($pp -contains 8080){"http://${ip}:8080"} elseif($pp -contains 443){"https://$ip"} else {"https://${ip}:8443"}
+                    try{
+                        $hd=curl.exe -skI -L --max-time 3 $u 2>$null
+                        $sv=($hd | Where-Object { $_ -match '(?i)^Server:\s*(.+)$' } | Select-Object -First 1)
+                        if($sv -match '(?i)^Server:\s*(.+)$'){ $found="Server: "+($matches[1].Trim()) }
+                    } catch {}
+                }
+                if($found){ @{IP=$ip;B=$found.Substring(0,[Math]::Min($found.Length,120))} }
+            }).AddArgument($ip).AddArgument($pp)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }
+        $out=@{}
+        $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r.B}; $_.PS.Dispose() }
+        return $out
+    } finally {
+        $pool.Close(); $pool.Dispose()
+    }
+}
+
+# ── SNMP v1 GET (sysDescr + sysName), community public ─────────────────────────
+function New-SnmpRequest {
+    function EncLen($n){ if($n -lt 128){ return ,([byte]$n) }; $b=@(); while($n -gt 0){ $b=@([byte]($n -band 0xFF))+$b; $n=$n -shr 8 }; return @([byte](0x80 -bor $b.Count))+$b }
+    function EncTLV($tag,$val){ $v=@($val); return @([byte]$tag)+(EncLen $v.Count)+$v }
+    $oidDescr = @(0x2B,0x06,0x01,0x02,0x01,0x01,0x01,0x00)  # 1.3.6.1.2.1.1.1.0
+    $oidName  = @(0x2B,0x06,0x01,0x02,0x01,0x01,0x05,0x00)  # 1.3.6.1.2.1.1.5.0
+    $vb1 = EncTLV 0x30 ((EncTLV 0x06 $oidDescr)+(EncTLV 0x05 @()))
+    $vb2 = EncTLV 0x30 ((EncTLV 0x06 $oidName )+(EncTLV 0x05 @()))
+    $vbl = EncTLV 0x30 ($vb1+$vb2)
+    $pduBody = (EncTLV 0x02 @(0x27,0x0F))+(EncTLV 0x02 @(0x00))+(EncTLV 0x02 @(0x00))+$vbl
+    $pdu = EncTLV 0xA0 $pduBody
+    $body = (EncTLV 0x02 @(0x00))+(EncTLV 0x04 ([System.Text.Encoding]::ASCII.GetBytes("public")))+$pdu
+    return ,([byte[]](EncTLV 0x30 $body))
+}
+
+function Invoke-Snmp([string[]]$IPs, [byte[]]$Request, [int]$Threads=60, [int]$Ms=600) {
+    if (-not $IPs) { return @{} }
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
+    try {
+        $jobs = $IPs | ForEach-Object {
+            $ps = [PowerShell]::Create().AddScript({
+                param($ip,$req,$ms)
+                try {
+                    $udp=New-Object System.Net.Sockets.UdpClient
+                    $udp.Client.ReceiveTimeout=$ms
+                    [void]$udp.Send($req,$req.Length,$ip,161)
+                    $ep=New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,0)
+                    $r=$udp.Receive([ref]$ep); $udp.Close()
+                    if(-not $r -or $r.Length -lt 2 -or $r[0] -ne 0x30){ return }
+                    # lector de longitud BER
+                    $script:pos=0
+                    function RL($b){ $l=$b[$script:pos]; $script:pos++; if($l -band 0x80){ $n=$l -band 0x7F; $l=0; for($j=0;$j -lt $n;$j++){ $l=($l -shl 8) -bor $b[$script:pos]; $script:pos++ } }; return $l }
+                    $script:pos=1; [void](RL $r)          # SEQ
+                    $script:pos++; $vl=RL $r; $script:pos+=$vl   # version
+                    $script:pos++; $cl=RL $r; $script:pos+=$cl   # community
+                    $script:pos++; [void](RL $r)          # PDU (0xA2)
+                    $script:pos++; $il=RL $r; $script:pos+=$il   # request-id
+                    $script:pos++; $il=RL $r; $script:pos+=$il   # error-status
+                    $script:pos++; $il=RL $r; $script:pos+=$il   # error-index
+                    $script:pos++; [void](RL $r)          # varbind list SEQ
+                    $vals=@()
+                    while($script:pos -lt $r.Length){
+                        if($r[$script:pos] -ne 0x30){ break }
+                        $script:pos++; $vbl=RL $r; $vbEnd=$script:pos+$vbl
+                        if($r[$script:pos] -ne 0x06){ break }
+                        $script:pos++; $ol=RL $r; $script:pos+=$ol   # OID
+                        $vtag=$r[$script:pos]; $script:pos++; $vlen=RL $r
+                        if($vtag -eq 0x04 -and $vlen -gt 0){
+                            $vals += ([System.Text.Encoding]::UTF8.GetString($r,$script:pos,$vlen) -replace '[\r\n]',' ').Trim()
+                        } else { $vals += "" }
+                        $script:pos=$vbEnd
+                    }
+                    $descr = if($vals.Count -ge 1){ $vals[0] } else { "" }
+                    $name  = if($vals.Count -ge 2){ $vals[1] } else { "" }
+                    if($descr -or $name){ @{IP=$ip;Descr=$descr;Name=$name} }
+                } catch {}
+            }).AddArgument($_).AddArgument($Request).AddArgument($Ms)
+            $ps.RunspacePool = $pool
+            @{PS=$ps; H=$ps.BeginInvoke()}
+        }
+        $out=@{}
+        $jobs | ForEach-Object { $r=$_.PS.EndInvoke($_.H); if($r){$out[$r.IP]=$r}; $_.PS.Dispose() }
+        return $out
+    } finally {
+        $pool.Close(); $pool.Dispose()
+    }
+}
+
 # ── HTTP title paralelo ───────────────────────────────────────────────────────
 function Invoke-HttpTitles([string[]]$IPs, [hashtable]$PortTable, [int]$Threads=30) {
     if (-not $IPs) { return @{} }
@@ -277,35 +700,157 @@ function Invoke-HttpTitles([string[]]$IPs, [hashtable]$PortTable, [int]$Threads=
     }
 }
 
-# ── Tabla con colores ─────────────────────────────────────────────────────────
+# ── Historial de dispositivos conocidos (alias + primera/ultima vez) ───────────
+function Get-KnownDevices {
+    if (Test-Path $KnownFile) {
+        try {
+            $h=@{}
+            (Get-Content $KnownFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $h[$_.Name]=$_.Value }
+            return $h
+        } catch { return @{} }
+    }
+    return @{}
+}
+
+function Save-KnownDevices($known) {
+    try {
+        if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+        $known | ConvertTo-Json -Depth 4 | Set-Content $KnownFile -Encoding UTF8
+    } catch {}
+}
+
+# ── Prioridad de tipo para ordenar/agrupar ────────────────────────────────────
+function Get-TypeRank($tipo) {
+    switch -Regex ($tipo) {
+        "Este PC"        { return 0 }
+        "^Router$"       { return 1 }
+        "Router sec"     { return 2 }
+        "Repetidor"      { return 3 }
+        "Camara"         { return 4 }
+        "Impresora"      { return 5 }
+        "TV/Media"       { return 6 }
+        "IoT|Asistente"  { return 7 }
+        "Consola"        { return 8 }
+        "Movil"          { return 9 }
+        "PC|Raspberry"   { return 10 }
+        default          { return 11 }
+    }
+}
+
+# ── Tabla con colores (agrupada por tipo) ─────────────────────────────────────
 function Show-Table($rows, $gateway, $miIP) {
-    $w = @{IP=16;MAC=19;Ms=7;OS=13;Tipo=14;Nombre=20;Fab=14;Ports=16}
-    $fmt = "  {0,-$($w.IP)} {1,-$($w.MAC)} {2,-$($w.Ms)} {3,-$($w.OS)} {4,-$($w.Tipo)} {5,-$($w.Nombre)} {6,-$($w.Fab)} {7}"
-    $hdr = $fmt -f "IP","MAC","Ping","OS","Tipo","Nombre","Fabricante","Puertos"
+    $w = @{IP=16;MAC=19;Ms=7;Tipo=14;Nombre=22;Fab=14;Ports=16}
+    $fmt = "  {0,-$($w.IP)} {1,-$($w.MAC)} {2,-$($w.Ms)} {3,-$($w.Tipo)} {4,-$($w.Nombre)} {5,-$($w.Fab)} {6}"
+    $hdr = $fmt -f "IP","MAC","Ping","Tipo","Nombre","Fabricante","Puertos"
     Write-Host $hdr -ForegroundColor White
     Write-Host ("  " + "-" * ($hdr.Length - 2)) -ForegroundColor DarkGray
     foreach ($r in $rows) {
-        $col = if ($r.IP -eq $miIP)                                              { "Cyan" }
-               elseif ($r.IP -eq $gateway)                                       { "Green" }
-               elseif ($r.Tipo -match "Repetidor")                              { "Magenta" }
-               elseif ($r.Raw -and ($r.Raw | Where-Object {$_ -in 21,23}))       { "Yellow" }
-               elseif ($r.Fab -eq "-" -and $r.Nombre -eq "-")                   { "DarkGray" }
-               else                                                               { "Gray" }
+        $col = if ($r.IP -eq $miIP)                                        { "Cyan" }
+               elseif ($r.IP -eq $gateway)                                 { "Green" }
+               elseif ($r.Tipo -match "Repetidor|Router sec")             { "Magenta" }
+               elseif ($r.Nuevo)                                           { "Red" }
+               elseif ($r.Raw -and ($r.Raw | Where-Object {$_ -in 21,23})) { "Yellow" }
+               elseif ($r.Fab -eq "-" -and $r.Nombre -eq "-")             { "DarkGray" }
+               else                                                         { "Gray" }
+        $nm = if ($r.Nuevo) { "* " + $r.Nombre } else { $r.Nombre }
         $line = $fmt -f `
-            $r.IP, $r.MAC, $r.Ping, $r.OS,
+            $r.IP, $r.MAC, $r.Ping,
             ($r.Tipo.Substring(0,[Math]::Min($r.Tipo.Length,$w.Tipo-1))),
-            ($r.Nombre.Substring(0,[Math]::Min($r.Nombre.Length,$w.Nombre-1))),
+            ($nm.Substring(0,[Math]::Min($nm.Length,$w.Nombre-1))),
             ($r.Fab.Substring(0,[Math]::Min($r.Fab.Length,$w.Fab-1))),
             $r.Ports
         Write-Host $line -ForegroundColor $col
     }
     Write-Host ""
     Write-Host "  " -NoNewline
-    Write-Host "Cyan" -ForegroundColor Cyan -NoNewline; Write-Host "=Este PC  " -NoNewline
-    Write-Host "Verde" -ForegroundColor Green -NoNewline; Write-Host "=Gateway  " -NoNewline
+    Write-Host "Cyan" -ForegroundColor Cyan -NoNewline;    Write-Host "=Este PC  " -NoNewline
+    Write-Host "Verde" -ForegroundColor Green -NoNewline;  Write-Host "=Gateway  " -NoNewline
     Write-Host "Magenta" -ForegroundColor Magenta -NoNewline; Write-Host "=Repetidor/AP  " -NoNewline
+    Write-Host "Rojo" -ForegroundColor Red -NoNewline;     Write-Host "=Nuevo (*)  " -NoNewline
     Write-Host "Amarillo" -ForegroundColor Yellow -NoNewline; Write-Host "=Puerto inseguro  " -NoNewline
     Write-Host "Gris" -ForegroundColor DarkGray -NoNewline; Write-Host "=Sin identificar"
+}
+
+# ── Reporte HTML ──────────────────────────────────────────────────────────────
+function Export-HtmlReport($rows, $wifi, $gateway, $miIP, $ssid, $path) {
+    function HtmlEsc($s){ if($null -eq $s){return ""}; return [System.Net.WebUtility]::HtmlEncode([string]$s) }
+    $total   = $rows.Count
+    $nRepes  = @($rows | Where-Object { $_.Tipo -match "Repetidor|Router sec" }).Count
+    $nNuevos = @($rows | Where-Object { $_.Nuevo }).Count
+    $nCam    = @($rows | Where-Object { $_.Tipo -eq "Camara" }).Count
+    $fecha   = Get-Date -Format "yyyy-MM-dd HH:mm"
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append(@"
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Escaner de Red - $fecha</title>
+<style>
+:root{--bg:#0f1420;--card:#1a2232;--edge:#2a3550;--tx:#e6ecf5;--mut:#8a97b0;--acc:#4da3ff;--mag:#e061e0;--red:#ff6b6b;--grn:#4bd18a;--yel:#ffd166}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 'Segoe UI',system-ui,sans-serif;padding:24px}
+h1{font-size:22px;margin:0 0 2px}.sub{color:var(--mut);margin-bottom:20px;font-size:13px}
+.cards{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:24px}
+.card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:14px 18px;min-width:120px}
+.card .n{font-size:26px;font-weight:700}.card .l{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.card.mag .n{color:var(--mag)}.card.red .n{color:var(--red)}.card.acc .n{color:var(--acc)}
+h2{font-size:15px;margin:22px 0 10px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--edge);font-size:13px}
+th{background:#141b28;color:var(--mut);cursor:pointer;user-select:none;position:sticky;top:0}
+tr:hover td{background:#212b3f}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+.b-rep{background:rgba(224,97,224,.18);color:var(--mag)}.b-rt{background:rgba(75,209,138,.18);color:var(--grn)}
+.b-cam{background:rgba(255,209,102,.18);color:var(--yel)}.b-new{background:rgba(255,107,107,.18);color:var(--red)}
+.b-def{background:rgba(138,151,176,.15);color:var(--mut)}
+.mono{font-family:Consolas,monospace}.mut{color:var(--mut)}.star{color:var(--red);font-weight:700}
+.wifi{display:flex;flex-wrap:wrap;gap:12px}.ap{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:12px 16px;min-width:200px}
+.ap .bs{font-family:Consolas,monospace;font-size:13px}.ap.me{border-color:var(--acc)}.bar{height:6px;background:#141b28;border-radius:4px;margin-top:6px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--acc)}
+footer{color:var(--mut);font-size:12px;margin-top:28px}
+</style></head><body>
+<h1>Escaner de Red</h1><div class="sub">$fecha &nbsp;&middot;&nbsp; red $(HtmlEsc $miIP) &nbsp;&middot;&nbsp; gateway $(HtmlEsc $gateway)$(if($ssid){" &middot; SSID "+(H $ssid)})</div>
+<div class="cards">
+<div class="card acc"><div class="n">$total</div><div class="l">Dispositivos</div></div>
+<div class="card mag"><div class="n">$nRepes</div><div class="l">Repetidores/AP</div></div>
+<div class="card red"><div class="n">$nNuevos</div><div class="l">Nuevos</div></div>
+<div class="card"><div class="n">$nCam</div><div class="l">Camaras</div></div>
+</div>
+"@)
+    # Seccion WiFi
+    if ($wifi -and $wifi.APs -and $wifi.APs.Count) {
+        [void]$sb.Append("<h2>Puntos de acceso WiFi &mdash; SSID $(HtmlEsc $wifi.SSID) ($($wifi.APs.Count) radios)</h2><div class='wifi'>")
+        foreach ($ap in ($wifi.APs | Sort-Object { -1 * [int]$_.Signal })) {
+            $me = if ($ap.BSSID -eq $wifi.MyBssid) { " me" } else { "" }
+            $tag = if ($ap.BSSID -eq $wifi.MyBssid) { " <span class='badge b-rt'>conectado</span>" } else { " <span class='badge b-rep'>repetidor/AP</span>" }
+            $vend = Get-Vendor $ap.BSSID
+            $sig = [int]$ap.Signal
+            [void]$sb.Append("<div class='ap$me'><div class='bs'>$(HtmlEsc $ap.BSSID)$tag</div><div class='mut'>$(HtmlEsc $vend) &middot; canal $(HtmlEsc $ap.Channel) &middot; $(HtmlEsc $ap.Radio)</div><div class='mut'>señal $sig%</div><div class='bar'><i style='width:$sig%'></i></div></div>")
+        }
+        [void]$sb.Append("</div>")
+    } elseif ($wifi -and $wifi.Error -eq "location") {
+        [void]$sb.Append("<h2>Puntos de acceso WiFi</h2><div class='ap'>Windows requiere <b>Servicios de ubicacion</b> activados para listar los BSSID. Actívalos en Configuracion &gt; Privacidad &gt; Ubicacion.</div>")
+    }
+    # Tabla principal
+    [void]$sb.Append("<h2>Dispositivos</h2><table id='t'><thead><tr><th>IP</th><th>MAC</th><th>Ping</th><th>Tipo</th><th>Nombre</th><th>Fabricante</th><th>Puertos</th><th>Info (SNMP / banner)</th></tr></thead><tbody>")
+    foreach ($r in $rows) {
+        $cls = switch -Regex ($r.Tipo) { "Repetidor" {"b-rep"} "Router sec" {"b-rt"} "^Router$" {"b-rt"} "Camara" {"b-cam"} default {"b-def"} }
+        $star = if ($r.Nuevo) { "<span class='star'>&#9733; </span>" } else { "" }
+        $newb = if ($r.Nuevo) { " <span class='badge b-new'>nuevo</span>" } else { "" }
+        [void]$sb.Append("<tr><td class='mono'>$(HtmlEsc $r.IP)</td><td class='mono mut'>$(HtmlEsc $r.MAC)</td><td>$(HtmlEsc $r.Ping)</td><td><span class='badge $cls'>$(HtmlEsc $r.Tipo)</span></td><td>$star$(HtmlEsc $r.Nombre)$newb</td><td>$(HtmlEsc $r.Fab)</td><td class='mono mut'>$(HtmlEsc $r.Ports)</td><td class='mut'>$(HtmlEsc $r.Info)</td></tr>")
+    }
+    [void]$sb.Append(@"
+</tbody></table>
+<footer>Generado por Network Scanner v6.0 &middot; Lucas M. Vicente</footer>
+<script>
+document.querySelectorAll('#t th').forEach((th,i)=>th.addEventListener('click',()=>{
+ const tb=th.closest('table').querySelector('tbody');
+ const rows=[...tb.rows];const asc=th._a=!th._a;
+ rows.sort((a,b)=>{const x=a.cells[i].innerText,y=b.cells[i].innerText;
+  const nx=parseFloat(x),ny=parseFloat(y);
+  if(!isNaN(nx)&&!isNaN(ny))return asc?nx-ny:ny-nx;
+  return asc?x.localeCompare(y):y.localeCompare(x);});
+ rows.forEach(r=>tb.appendChild(r));}));
+</script></body></html>
+"@)
+    [System.IO.File]::WriteAllText($path, $sb.ToString(), [System.Text.Encoding]::UTF8)
 }
 
 # ── Créditos ──────────────────────────────────────────────────────────────────
@@ -314,8 +859,8 @@ function Show-Credits {
     Write-Host ""
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
-    Write-Host "  |          N E T W O R K   S C A N N E R                 |" -ForegroundColor Cyan
-    Write-Host "  |                      v5.3  -  2026                     |" -ForegroundColor Cyan
+    Write-Host "  |          N E T W O R K   S C A N N E R                  |" -ForegroundColor Cyan
+    Write-Host "  |                      v6.0  -  2026                      |" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host ""
@@ -325,15 +870,21 @@ function Show-Credits {
     Write-Host "    Claude  (Anthropic)" -ForegroundColor Magenta
     Write-Host "    OpenAI Codex  (optimizacion y mantenimiento)" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  SSDP/UPnP - Ping paralelo - Port scan - DNS reverso" -ForegroundColor DarkGray
-    Write-Host "  HTTP title - OUI MAC lookup - TTL OS detection" -ForegroundColor DarkGray
-    Write-Host "  Clasificacion de dispositivos - Deteccion de repetidores/AP" -ForegroundColor DarkGray
+    Write-Host "  WiFi BSSID - mDNS - NetBIOS - SNMP - Banners - OUI IEEE" -ForegroundColor DarkGray
+    Write-Host "  SSDP/UPnP - Ping/Port scan - Clasificacion - Reporte HTML" -ForegroundColor DarkGray
     Write-Host ""
     Start-Sleep -Seconds 2
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
 Show-Credits
+
+# Cargar base OUI IEEE (cache/descarga) una vez por ejecucion
+Write-Host "  Cargando base de fabricantes OUI..." -NoNewline -ForegroundColor DarkGray
+$OUIFull = Get-OuiDatabase
+if ($OUIFull.Count -gt 1000) { Write-Host " $($OUIFull.Count) fabricantes." -ForegroundColor Green }
+else { Write-Host " tabla base (sin catalogo IEEE)." -ForegroundColor DarkGray }
 
 do {
     Clear-Host
@@ -375,42 +926,17 @@ do {
     $subred  = ($miIP -split "\." | Select-Object -First 3) -join "."
     Write-Host "  $($sel.Nombre)  |  $miIP  |  gw $gateway`n" -ForegroundColor DarkGray
 
-    # SSDP en background mientras corre el ping
-    $ssdpJob = Start-Job -ScriptBlock {
-        $msg   = "M-SEARCH * HTTP/1.1`r`nHOST: 239.255.255.250:1900`r`nMAN: `"ssdp:discover`"`r`nMX: 2`r`nST: ssdp:all`r`n`r`n"
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($msg)
-        $udp   = New-Object System.Net.Sockets.UdpClient
-        $udp.Client.ReceiveTimeout = 2500
-        $ep    = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("239.255.255.250"), 1900)
-        [void]$udp.Send($bytes, $bytes.Length, $ep)
-        $seen = @{}; $out = @{}
-        while ($true) {
-            try {
-                $data = $udp.Receive([ref]$ep); $ip = $ep.Address.ToString()
-                if ($seen[$ip]) { continue }; $seen[$ip] = $true
-                $txt = [System.Text.Encoding]::ASCII.GetString($data)
-                $loc = if ($txt -match "(?i)LOCATION:\s*(\S+)") { $matches[1] } else { $null }
-                $out[$ip] = [PSCustomObject]@{ FriendlyName=$null; Manufacturer=$null; LocationURL=$loc }
-            } catch { break }
-        }
-        $udp.Close()
-        foreach ($ip in @($out.Keys)) {
-            if (-not $out[$ip].LocationURL) { continue }
-            try {
-                $xml = [xml](curl.exe -sk -L --max-time 2 $out[$ip].LocationURL 2>$null)
-                $out[$ip].FriendlyName = $xml.root.device.friendlyName
-                $out[$ip].Manufacturer = $xml.root.device.manufacturer
-            } catch {}
-        }
-        return $out
-    }
+    # Jobs de escucha (corren mientras hacemos ping/puertos)
+    $ssdpJob  = Start-SsdpJob
+    $mdnsJob  = Start-MdnsJob
 
-    Write-Host "  [1/4] Ping + SSDP..." -NoNewline
-    $pingData    = Invoke-PingSweep $subred
-    $upnp        = Receive-Job $ssdpJob -Wait -AutoRemoveJob
-    if (-not $upnp) { $upnp = @{} }
-    Write-Host " $($pingData.Count) activos, $($upnp.Count) UPnP" -ForegroundColor Green
+    $step = 0; $steps = 8
+    function Progreso($msg){ $script:step++; Write-Progress -Activity "Escaneando $subred.0/24" -Status "$msg" -PercentComplete ([int](($script:step/$steps)*100)) }
 
+    Progreso "Ping sweep + descubrimiento SSDP/mDNS"
+    $pingData = Invoke-PingSweep $subred
+
+    Progreso "Leyendo tabla ARP"
     $macTable = @{}
     Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.LinkLayerAddress -notmatch "FF-FF|00-00-00-00-00-00" } |
@@ -422,63 +948,171 @@ do {
     }
     $allIPs = $ipSet.Keys | Sort-Object { [version]$_ }
 
-    Write-Host "  [2/4] DNS reverso..." -NoNewline
-    $dns = Invoke-DnsReverse $allIPs
-    Write-Host " listo." -ForegroundColor Green
-
-    Write-Host "  [3/4] Puertos..." -NoNewline
+    Progreso "Escaneo de puertos"
     $ports = Invoke-PortScan $allIPs
-    Write-Host " listo." -ForegroundColor Green
 
-    Write-Host "  [4/4] Titulos HTTP..." -NoNewline
-    $titles = Invoke-HttpTitles $allIPs $ports
-    Write-Host " listo." -ForegroundColor Green
+    Progreso "DNS reverso + NetBIOS"
+    $dns      = Invoke-DnsReverse $allIPs
+    $netbios  = Invoke-Netbios $allIPs
+
+    Progreso "SNMP (modelos de equipo)"
+    $snmp = Invoke-Snmp $allIPs (New-SnmpRequest)
+
+    Progreso "Banners de servicio + titulos HTTP"
+    $banners = Invoke-Banners $allIPs $ports
+    $titles  = Invoke-HttpTitles $allIPs $ports
+
+    Progreso "Radios WiFi (BSSID)"
+    $wifi = Get-WifiAPs
+
+    Progreso "Recolectando descubrimiento pasivo"
+    $upnp = Receive-Job $ssdpJob -Wait -AutoRemoveJob; if (-not $upnp) { $upnp = @{} }
+    $mdns = Receive-Job $mdnsJob -Wait -AutoRemoveJob; if (-not $mdns) { $mdns = @{} }
+    Write-Progress -Activity "Escaneando" -Completed
 
     # Fabricante del gateway (por OUI) para detectar repetidores de la misma malla
     $gatewayVendor = Get-Vendor $macTable[$gateway]
+
+    # Historial de dispositivos conocidos
+    $known = Get-KnownDevices
+    $ahora = (Get-Date).ToString("yyyy-MM-dd HH:mm")
 
     # Construir filas
     $rows = $allIPs | ForEach-Object {
         $ip  = $_
         $mac = if ($macTable[$ip]) { $macTable[$ip] } else { "-" }
+        $macKey = ($mac -replace "[-:]","").ToUpper()
         $u   = $upnp[$ip]
+        $sn  = $snmp[$ip]
         $raw = if ($ports[$ip]) { $ports[$ip] | Sort-Object } else { @() }
-        $nombre = if ($u.FriendlyName) { $u.FriendlyName } elseif ($titles[$ip]) { $titles[$ip] } elseif ($dns[$ip]) { $dns[$ip] } else { "-" }
-        $fab    = if ($u.Manufacturer) { $u.Manufacturer } else { Get-Vendor $mac }
+
+        # Info tecnica (SNMP sysDescr preferente, si no banner)
+        $info = if ($sn -and $sn.Descr) { $sn.Descr } elseif ($banners[$ip]) { $banners[$ip] } else { "-" }
+
+        # Alias del historial (por MAC)
+        $alias = $null
+        if ($macKey -and $known[$macKey] -and $known[$macKey].alias) { $alias = $known[$macKey].alias }
+
+        # Nombre: alias > SNMP sysName > UPnP > mDNS > NetBIOS > HTTP title > DNS
+        $nombre = if ($alias) { $alias }
+                  elseif ($sn -and $sn.Name)   { $sn.Name }
+                  elseif ($u.FriendlyName)      { $u.FriendlyName }
+                  elseif ($mdns[$ip])           { $mdns[$ip] }
+                  elseif ($netbios[$ip])        { $netbios[$ip] }
+                  elseif ($titles[$ip])         { $titles[$ip] }
+                  elseif ($dns[$ip])            { $dns[$ip] }
+                  else { "-" }
+
+        # Fabricante: UPnP > modelo UPnP > OUI
+        $fab = if ($u.Manufacturer) { $u.Manufacturer } else { Get-Vendor $mac }
+        $vkey = Get-Vendor $mac
+
+        # Nuevo si su MAC no estaba en el historial
+        $esNuevo = $false
+        if ($macKey -and $macKey -ne "-" -and -not $known[$macKey]) { $esNuevo = $true }
+
         [PSCustomObject]@{
             IP     = $ip
             MAC    = $mac
             Ping   = if ($pingData[$ip]) { "$($pingData[$ip].Ms)ms" } else { "-" }
             OS     = Get-OSFromTTL ($pingData[$ip].TTL)
-            Tipo   = Get-DeviceType (Get-Vendor $mac) $nombre $raw ($ip -eq $gateway) ($ip -eq $miIP) $gatewayVendor
+            Tipo   = Get-DeviceType $vkey $nombre $raw ($ip -eq $gateway) ($ip -eq $miIP) $gatewayVendor $info
             Nombre = $nombre
             Fab    = $fab
             Ports  = if ($raw) { $raw -join "," } else { "-" }
+            Info   = $info
             Raw    = $raw
+            Nuevo  = $esNuevo
         }
     }
+
+    # Ordenar por tipo (repetidores arriba) y luego IP
+    $rows = $rows | Sort-Object @{E={Get-TypeRank $_.Tipo}}, @{E={[version]$_.IP}}
+
+    # Actualizar historial
+    foreach ($r in $rows) {
+        $k = ($r.MAC -replace "[-:]","").ToUpper()
+        if (-not $k -or $k -eq "-") { continue }
+        if ($known[$k]) {
+            $known[$k].lastSeen = $ahora
+            if (-not $known[$k].alias) { $known[$k] | Add-Member -NotePropertyName alias -NotePropertyValue "" -Force }
+        } else {
+            $known[$k] = [PSCustomObject]@{ alias=""; ip=$r.IP; vendor=$r.Fab; firstSeen=$ahora; lastSeen=$ahora }
+        }
+    }
+    Save-KnownDevices $known
 
     Write-Host "`n  Dispositivos activos ($($allIPs.Count))" -ForegroundColor Cyan
     Write-Host ("  " + "-" * 100) -ForegroundColor DarkGray
     Show-Table $rows $gateway $miIP
 
-    # Resumen de repetidores / puntos de acceso detectados
-    $repes = @($rows | Where-Object { $_.Tipo -match "Repetidor" -and $_.IP -ne $gateway })
+    # Seccion WiFi (repetidores por radio)
+    if ($wifi.APs -and $wifi.APs.Count) {
+        Write-Host ""
+        Write-Host "  Radios WiFi de tu red '$($wifi.SSID)': $($wifi.APs.Count)" -ForegroundColor Magenta
+        foreach ($ap in ($wifi.APs | Sort-Object { -1 * [int]$_.Signal })) {
+            $tag = if ($ap.BSSID -eq $wifi.MyBssid) { "[conectado]" } else { "[repetidor/AP]" }
+            $vend = Get-Vendor $ap.BSSID
+            $col  = if ($ap.BSSID -eq $wifi.MyBssid) { "Green" } else { "Magenta" }
+            Write-Host ("    {0}  {1,-16} señal {2,3}%  canal {3,-4} {4}" -f $ap.BSSID, $vend, [int]$ap.Signal, $ap.Channel, $tag) -ForegroundColor $col
+        }
+        if ($wifi.APs.Count -gt 1) {
+            Write-Host "    -> $($wifi.APs.Count - 1) AP(s) ademas del que te da señal = repetidores/puntos de acceso de tu malla." -ForegroundColor DarkGray
+        }
+    } elseif ($wifi.Error -eq "location") {
+        Write-Host "`n  [WiFi] Windows pide 'Servicios de ubicacion' activados para ver los BSSID." -ForegroundColor Yellow
+        Write-Host "         Actívalos en: Configuracion > Privacidad y seguridad > Ubicacion." -ForegroundColor DarkGray
+    }
+
+    # Resumen de repetidores / puntos de acceso por IP
+    $repes = @($rows | Where-Object { $_.Tipo -match "Repetidor|Router sec" -and $_.IP -ne $gateway })
     if ($repes.Count) {
         Write-Host ""
-        Write-Host "  Posibles repetidores / APs: $($repes.Count)" -ForegroundColor Magenta
+        Write-Host "  Posibles repetidores / APs por IP: $($repes.Count)" -ForegroundColor Magenta
         foreach ($r in $repes) {
             $marca = if ($r.Fab -ne "-") { $r.Fab } else { "?" }
             $nom   = if ($r.Nombre -ne "-") { "  ($($r.Nombre))" } else { "" }
-            $seg   = if ($r.Tipo -eq "Repetidor/AP") { "" } else { "  [por confirmar]" }
+            $seg   = if ($r.Tipo -match "\?") { "  [por confirmar]" } else { "" }
             Write-Host "    - $($r.IP.PadRight(15)) $marca$nom$seg" -ForegroundColor Magenta
         }
     }
 
+    # Dispositivos nuevos
+    $nuevos = @($rows | Where-Object { $_.Nuevo })
+    if ($nuevos.Count) {
+        Write-Host ""
+        Write-Host "  Dispositivos nuevos desde el ultimo escaneo: $($nuevos.Count)" -ForegroundColor Red
+        foreach ($r in $nuevos) { Write-Host "    * $($r.IP.PadRight(15)) $($r.MAC)  $($r.Fab)" -ForegroundColor Red }
+    }
+
+    # Exportar CSV + HTML
     $fecha = Get-Date -Format "yyyyMMdd-HHmm"
-    $csv = "$env:USERPROFILE\Desktop\escaner-$fecha.csv"
-    $rows | Select-Object IP,MAC,Ping,OS,Tipo,Nombre,Fab,Ports | Export-Csv $csv -NoTypeInformation -Encoding UTF8
-    Write-Host "`n  Guardado: $csv" -ForegroundColor DarkGray
+    $csv   = "$env:USERPROFILE\Desktop\escaner-$fecha.csv"
+    $html  = "$env:USERPROFILE\Desktop\escaner-$fecha.html"
+    $rows | Select-Object IP,MAC,Ping,OS,Tipo,Nombre,Fab,Ports,Info,Nuevo | Export-Csv $csv -NoTypeInformation -Encoding UTF8
+    Export-HtmlReport $rows $wifi $gateway $miIP $wifi.SSID $html
+    Write-Host "`n  Guardado CSV : $csv" -ForegroundColor DarkGray
+    Write-Host "  Guardado HTML: $html" -ForegroundColor DarkGray
+    try { Start-Process $html } catch {}
     Write-Host ""
 
-} while ((Read-Host "  Escanear de nuevo? (s/n)") -eq "s")
+    # Menu: reescanear / alias / salir
+    $op = Read-Host "  [s] escanear de nuevo   [a] poner alias a una IP   [n] salir"
+    if ($op -eq "a") {
+        $aip = Read-Host "    IP a etiquetar"
+        $row = $rows | Where-Object { $_.IP -eq $aip } | Select-Object -First 1
+        if ($row -and $row.MAC -ne "-") {
+            $al = Read-Host "    Alias para $aip ($($row.MAC))"
+            $k  = ($row.MAC -replace "[-:]","").ToUpper()
+            if (-not $known[$k]) { $known[$k] = [PSCustomObject]@{ alias=""; ip=$aip; vendor=$row.Fab; firstSeen=$ahora; lastSeen=$ahora } }
+            $known[$k].alias = $al
+            Save-KnownDevices $known
+            Write-Host "    Alias guardado. Se mostrara en los proximos escaneos." -ForegroundColor Green
+            Start-Sleep -Seconds 1
+        } else {
+            Write-Host "    IP no encontrada o sin MAC." -ForegroundColor Yellow; Start-Sleep -Seconds 1
+        }
+        $op = "s"
+    }
+
+} while ($op -eq "s")
