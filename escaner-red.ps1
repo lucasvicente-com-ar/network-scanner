@@ -115,6 +115,43 @@ function Get-OSFromTTL($ttl) {
     return "Router/IoT"
 }
 
+# Fabricantes de equipamiento de red (routers, repetidores, APs, mesh)
+$NetVendors = @("TP-Link","ASUS","Netgear","D-Link","Linksys","Tenda","Mercusys","Eero","Ubiquiti")
+
+# ── Clasificacion de tipo de dispositivo ──────────────────────────────────────
+function Get-DeviceType($vendor, $name, $ports, $isGateway, $isSelf, $gatewayVendor) {
+    if ($isSelf)    { return "Este PC" }
+    if ($isGateway) { return "Router" }
+    $n = if ($name -and $name -ne "-") { $name } else { "" }
+    $hasWebAdmin = @($ports | Where-Object { $_ -in 80,443,8080,8443 }).Count -gt 0
+
+    # Nombre explicito de repetidor / mesh (UPnP, HTTP title o DNS)
+    if ($n -match "(?i)repeat|extend|range.?ext|\bRE\d|\bEX\d|mesh|deco|velop|orbi|\beero\b|access.?point|\bAP[- ]?\d") {
+        return "Repetidor/AP"
+    }
+    # Camara IP
+    if ($vendor -match "Hikvision|Ezviz" -or ($ports -contains 554)) { return "Camara" }
+    # Streaming / media
+    if ($vendor -match "Roku|Chromecast|Sonos") { return "TV/Media" }
+    # Consola
+    if ($vendor -eq "Nintendo") { return "Consola" }
+    # Mismo fabricante que el router + no es el gateway  => casi seguro repetidor/AP de la malla
+    if ($vendor -ne "-" -and $vendor -eq $gatewayVendor) { return "Repetidor/AP?" }
+    # Fabricante de red con panel de admin web => probable repetidor/AP
+    if (($NetVendors -contains $vendor) -and $hasWebAdmin)  { return "Repetidor/AP?" }
+    # Impresora
+    if ($ports -contains 9100) { return "Impresora" }
+    # Movil / tablet (fabricante de moviles y sin panel web)
+    if ($vendor -match "Apple|Samsung|Xiaomi|Huawei|LG|Sony" -and -not $hasWebAdmin) { return "Movil/Tablet" }
+    # Asistentes / altavoces
+    if ($vendor -match "Amazon|Google") { return "IoT/Asistente" }
+    # PC
+    if ($ports -contains 3389 -or $ports -contains 22) { return "PC" }
+    if ($vendor -match "Intel|Dell|^HP$|Lenovo|Microsoft|Realtek") { return "PC" }
+    if ($vendor -eq "Raspberry Pi") { return "Raspberry Pi" }
+    return "-"
+}
+
 # ── Ping sweep paralelo ───────────────────────────────────────────────────────
 function Invoke-PingSweep([string]$Subred, [int]$Threads=50, [int]$Ms=600) {
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
@@ -168,7 +205,7 @@ function Invoke-DnsReverse([string[]]$IPs, [int]$Threads=50) {
 # ── Port scan paralelo ────────────────────────────────────────────────────────
 function Invoke-PortScan([string[]]$IPs, [int]$Threads=150, [int]$Ms=350) {
     if (-not $IPs) { return @{} }
-    $ports = @(21,22,23,80,443,554,3389,8080,8443)
+    $ports = @(21,22,23,80,443,554,3389,8080,8443,9100)
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads); $pool.Open()
     try {
         $jobs = foreach ($ip in $IPs) { foreach ($p in $ports) {
@@ -242,18 +279,21 @@ function Invoke-HttpTitles([string[]]$IPs, [hashtable]$PortTable, [int]$Threads=
 
 # ── Tabla con colores ─────────────────────────────────────────────────────────
 function Show-Table($rows, $gateway, $miIP) {
-    $w = @{IP=16;MAC=20;Ms=7;OS=14;Nombre=22;Fab=16;Ports=20}
-    $hdr = "  {0,-$($w.IP)} {1,-$($w.MAC)} {2,-$($w.Ms)} {3,-$($w.OS)} {4,-$($w.Nombre)} {5,-$($w.Fab)} {6}" -f "IP","MAC","Ping","OS","Nombre","Fabricante","Puertos"
+    $w = @{IP=16;MAC=19;Ms=7;OS=13;Tipo=14;Nombre=20;Fab=14;Ports=16}
+    $fmt = "  {0,-$($w.IP)} {1,-$($w.MAC)} {2,-$($w.Ms)} {3,-$($w.OS)} {4,-$($w.Tipo)} {5,-$($w.Nombre)} {6,-$($w.Fab)} {7}"
+    $hdr = $fmt -f "IP","MAC","Ping","OS","Tipo","Nombre","Fabricante","Puertos"
     Write-Host $hdr -ForegroundColor White
     Write-Host ("  " + "-" * ($hdr.Length - 2)) -ForegroundColor DarkGray
     foreach ($r in $rows) {
         $col = if ($r.IP -eq $miIP)                                              { "Cyan" }
                elseif ($r.IP -eq $gateway)                                       { "Green" }
+               elseif ($r.Tipo -match "Repetidor")                              { "Magenta" }
                elseif ($r.Raw -and ($r.Raw | Where-Object {$_ -in 21,23}))       { "Yellow" }
                elseif ($r.Fab -eq "-" -and $r.Nombre -eq "-")                   { "DarkGray" }
                else                                                               { "Gray" }
-        $line = "  {0,-$($w.IP)} {1,-$($w.MAC)} {2,-$($w.Ms)} {3,-$($w.OS)} {4,-$($w.Nombre)} {5,-$($w.Fab)} {6}" -f `
+        $line = $fmt -f `
             $r.IP, $r.MAC, $r.Ping, $r.OS,
+            ($r.Tipo.Substring(0,[Math]::Min($r.Tipo.Length,$w.Tipo-1))),
             ($r.Nombre.Substring(0,[Math]::Min($r.Nombre.Length,$w.Nombre-1))),
             ($r.Fab.Substring(0,[Math]::Min($r.Fab.Length,$w.Fab-1))),
             $r.Ports
@@ -263,6 +303,7 @@ function Show-Table($rows, $gateway, $miIP) {
     Write-Host "  " -NoNewline
     Write-Host "Cyan" -ForegroundColor Cyan -NoNewline; Write-Host "=Este PC  " -NoNewline
     Write-Host "Verde" -ForegroundColor Green -NoNewline; Write-Host "=Gateway  " -NoNewline
+    Write-Host "Magenta" -ForegroundColor Magenta -NoNewline; Write-Host "=Repetidor/AP  " -NoNewline
     Write-Host "Amarillo" -ForegroundColor Yellow -NoNewline; Write-Host "=Puerto inseguro  " -NoNewline
     Write-Host "Gris" -ForegroundColor DarkGray -NoNewline; Write-Host "=Sin identificar"
 }
@@ -273,8 +314,8 @@ function Show-Credits {
     Write-Host ""
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
-    Write-Host "  |          N E T W O R K   S C A N N E R                  |" -ForegroundColor Cyan
-    Write-Host "  |                      v5.2  -  2026                      |" -ForegroundColor Cyan
+    Write-Host "  |          N E T W O R K   S C A N N E R                 |" -ForegroundColor Cyan
+    Write-Host "  |                      v5.3  -  2026                     |" -ForegroundColor Cyan
     Write-Host "  |                                                         |" -ForegroundColor Cyan
     Write-Host "  +---------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host ""
@@ -286,6 +327,7 @@ function Show-Credits {
     Write-Host ""
     Write-Host "  SSDP/UPnP - Ping paralelo - Port scan - DNS reverso" -ForegroundColor DarkGray
     Write-Host "  HTTP title - OUI MAC lookup - TTL OS detection" -ForegroundColor DarkGray
+    Write-Host "  Clasificacion de dispositivos - Deteccion de repetidores/AP" -ForegroundColor DarkGray
     Write-Host ""
     Start-Sleep -Seconds 2
 }
@@ -392,19 +434,25 @@ do {
     $titles = Invoke-HttpTitles $allIPs $ports
     Write-Host " listo." -ForegroundColor Green
 
+    # Fabricante del gateway (por OUI) para detectar repetidores de la misma malla
+    $gatewayVendor = Get-Vendor $macTable[$gateway]
+
     # Construir filas
     $rows = $allIPs | ForEach-Object {
         $ip  = $_
         $mac = if ($macTable[$ip]) { $macTable[$ip] } else { "-" }
         $u   = $upnp[$ip]
         $raw = if ($ports[$ip]) { $ports[$ip] | Sort-Object } else { @() }
+        $nombre = if ($u.FriendlyName) { $u.FriendlyName } elseif ($titles[$ip]) { $titles[$ip] } elseif ($dns[$ip]) { $dns[$ip] } else { "-" }
+        $fab    = if ($u.Manufacturer) { $u.Manufacturer } else { Get-Vendor $mac }
         [PSCustomObject]@{
             IP     = $ip
             MAC    = $mac
             Ping   = if ($pingData[$ip]) { "$($pingData[$ip].Ms)ms" } else { "-" }
             OS     = Get-OSFromTTL ($pingData[$ip].TTL)
-            Nombre = if ($u.FriendlyName) { $u.FriendlyName } elseif ($titles[$ip]) { $titles[$ip] } elseif ($dns[$ip]) { $dns[$ip] } else { "-" }
-            Fab    = if ($u.Manufacturer) { $u.Manufacturer } else { Get-Vendor $mac }
+            Tipo   = Get-DeviceType (Get-Vendor $mac) $nombre $raw ($ip -eq $gateway) ($ip -eq $miIP) $gatewayVendor
+            Nombre = $nombre
+            Fab    = $fab
             Ports  = if ($raw) { $raw -join "," } else { "-" }
             Raw    = $raw
         }
@@ -414,9 +462,22 @@ do {
     Write-Host ("  " + "-" * 100) -ForegroundColor DarkGray
     Show-Table $rows $gateway $miIP
 
+    # Resumen de repetidores / puntos de acceso detectados
+    $repes = @($rows | Where-Object { $_.Tipo -match "Repetidor" -and $_.IP -ne $gateway })
+    if ($repes.Count) {
+        Write-Host ""
+        Write-Host "  Posibles repetidores / APs: $($repes.Count)" -ForegroundColor Magenta
+        foreach ($r in $repes) {
+            $marca = if ($r.Fab -ne "-") { $r.Fab } else { "?" }
+            $nom   = if ($r.Nombre -ne "-") { "  ($($r.Nombre))" } else { "" }
+            $seg   = if ($r.Tipo -eq "Repetidor/AP") { "" } else { "  [por confirmar]" }
+            Write-Host "    - $($r.IP.PadRight(15)) $marca$nom$seg" -ForegroundColor Magenta
+        }
+    }
+
     $fecha = Get-Date -Format "yyyyMMdd-HHmm"
     $csv = "$env:USERPROFILE\Desktop\escaner-$fecha.csv"
-    $rows | Select-Object IP,MAC,Ping,OS,Nombre,Fab,Ports | Export-Csv $csv -NoTypeInformation -Encoding UTF8
+    $rows | Select-Object IP,MAC,Ping,OS,Tipo,Nombre,Fab,Ports | Export-Csv $csv -NoTypeInformation -Encoding UTF8
     Write-Host "`n  Guardado: $csv" -ForegroundColor DarkGray
     Write-Host ""
 
